@@ -7,3 +7,14 @@
 ## Physical Prototype 
 
 <img src="https://github.com/jonss0777/Slitting-Machine-Automation-Edge-Controller/blob/4bc047450b78f70a8ab5b4a210fc4cb815701a6f/Circuit.jpeg" alt="Physical Circuit" width="600" height="750">
+
+## Tools
+**Software** 
+- OPEN PLC
+- Modbus RTU (python)
+- Fast API
+- Angular
+
+**Hardware**
+- ESP32
+- Rasberry PI

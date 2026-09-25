@@ -1,0 +1,19 @@
+{
+  "deviceBoard": "ESP32-DOIT DEVKIT V1",
+  "communicationPort": "COM6",
+  "runtimeIpAddress": "",
+  "vendorScreenData": {
+    "modbus_rtu": {
+      "enabled": true
+    }
+  },
+  "vendorScreenDataByBoard": {
+    "OpenPLC Simulator": {},
+    "ESP32-DOIT DEVKIT V1": {
+      "modbus_rtu": {
+        "enabled": true
+      }
+    }
+  },
+  "selectedPlatformOptions": {}
+}

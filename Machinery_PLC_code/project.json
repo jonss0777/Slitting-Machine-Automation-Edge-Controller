@@ -1,0 +1,45 @@
+{
+  "meta": {
+    "name": "V0",
+    "type": "plc-project"
+  },
+  "data": {
+    "dataTypes": [],
+    "pous": [],
+    "configuration": {
+      "resource": {
+        "tasks": [
+          {
+            "name": "task0",
+            "triggering": "Cyclic",
+            "interval": "T#20ms",
+            "priority": 1
+          }
+        ],
+        "instances": [
+          {
+            "name": "instance0",
+            "task": "task0",
+            "program": "main"
+          }
+        ],
+        "globalVariables": []
+      }
+    },
+    "libraries": [],
+    "debugVariables": {
+      "pous": {
+        "main": [
+          "i_SystemReset",
+          "q_Pneumatics",
+          "q_Conveyor",
+          "q_Slitting",
+          "q_Offload",
+          "State",
+          "b_SafetiesOK",
+          "b_StartCycle"
+        ]
+      }
+    }
+  }
+}

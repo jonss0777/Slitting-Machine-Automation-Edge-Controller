@@ -1,0 +1,486 @@
+// Baremetal.ino -- OpenPLC Arduino runtime entry sketch.
+//
+// This is a STATIC sketch -- the same code for every project. It hosts the
+// I/O buffers, Modbus glue, and the scan-cycle scheduler. Every strucpp
+// type, every PLC POU instance, and every library body lives in the
+// arduino library at src/ (compiled as separate translation units that
+// never see Arduino.h). The sketch only talks to that library through the
+// thin C-linkage surface in arduino_runtime_glue.h.
+//
+// Why the separation: arduino-cli auto-prepends <Arduino.h> to every .ino
+// translation unit. Arduino.h defines macros named DEFAULT / HIGH / LOW /
+// PI / B0..B7 / INPUT / OUTPUT and others that collide with struct member
+// names emitted by strucpp's library bodies (most visibly OSCAT's
+// CONSTANTS_LANGUAGE.DEFAULT). Keeping every strucpp class body out of
+// the .ino's TU removes the entire class of collisions in one move.
+
+// Arduino.h defines min/max/abs/round as function-like macros that break
+// C++ standard library templates (<algorithm>, <limits>, etc).
+#undef min
+#undef max
+#undef abs
+#undef round
+
+// Triggers arduino-cli's library discovery for the OpenPLCUserLib precompiled
+// archive. Without this include arduino-cli still finds the library on disk
+// but skips linking against the .a (no header match in the sketch).
+#include <OpenPLCUserLib.h>
+
+#include "openplc.h"
+#include "defines.h"
+#include "arduino_runtime_glue.h"
+#include "license_gate.h"
+#include "license_store.h"   // license_store_read + LIC_BLOB_SIZE (via license_blob.h)
+
+#if defined(MODBUS_ENABLED) || defined(DEBUGGER_ENABLED)
+#include "ModbusSlave.h"
+#endif
+
+// Include WiFi lib to turn off WiFi radio on ESP32/ESP8266 if not using WiFi
+#ifndef MBTCP
+    #if defined(BOARD_ESP8266)
+        #include <ESP8266WiFi.h>
+    #elif defined(BOARD_ESP32)
+        #include <WiFi.h>
+    #endif
+#endif
+
+// ---------------------------------------------------------------------------
+// AVR: provide sized operator delete (virtual destructors generate this).
+// Non-AVR libstdc++ already declares operator delete(void*, size_t) noexcept;
+// redeclaring here causes a signature mismatch on ARM/mbed cores.
+// ---------------------------------------------------------------------------
+#ifdef __AVR__
+void operator delete(void* ptr, unsigned int)
+{
+    free(ptr);
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// I/O Buffer definitions (declared extern in openplc.h, must be defined
+// here so they have external linkage. The glue's runtime_bind_located_vars
+// reads/writes these slots.)
+// ---------------------------------------------------------------------------
+IEC_BOOL *bool_input[MAX_DIGITAL_INPUT/8][8] = {};
+IEC_BOOL *bool_output[MAX_DIGITAL_OUTPUT/8][8] = {};
+IEC_UINT *int_input[MAX_ANALOG_INPUT] = {};
+IEC_UINT *int_output[MAX_ANALOG_OUTPUT] = {};
+#if !defined(__AVR_ATmega328P__) && !defined(__AVR_ATmega168__) && !defined(__AVR_ATmega32U4__) && !defined(__AVR_ATmega16U4__)
+// REAL-typed I/O at %ID / %QD.  Populated by `runtime_bind_located_vars`
+// when the IEC program declares a REAL variable AT %ID<n> / %QD<n>.
+// Drivers that want to deliver engineering-unit values (volts, mA, °C)
+// instead of raw ADC counts write into these slots — the Opta HAL is
+// the first consumer.
+IEC_REAL *real_input[MAX_REAL_INPUT] = {};
+IEC_REAL *real_output[MAX_REAL_OUTPUT] = {};
+IEC_UINT *int_memory[MAX_MEMORY_WORD] = {};
+IEC_UDINT *dint_memory[MAX_MEMORY_DWORD] = {};
+IEC_ULINT *lint_memory[MAX_MEMORY_LWORD] = {};
+#endif
+
+// ---------------------------------------------------------------------------
+// Scan cycle timing
+// ---------------------------------------------------------------------------
+unsigned long scan_cycle;
+unsigned long last_run = 0;
+bool first_cycle = false;
+
+// ---------------------------------------------------------------------------
+// Module includes and external sketch support
+// ---------------------------------------------------------------------------
+#include "arduino_libs.h"
+
+#ifdef USE_ARDUINO_SKETCH
+    #include "ext/arduino_sketch.h"
+#endif
+
+extern uint8_t pinMask_DIN[];
+extern uint8_t pinMask_AIN[];
+extern uint8_t pinMask_DOUT[];
+extern uint8_t pinMask_AOUT[];
+
+// ---------------------------------------------------------------------------
+// Scan cycle delay setup
+// ---------------------------------------------------------------------------
+void setupCycleDelay(unsigned long long cycle_time)
+{
+    scan_cycle = (uint32_t)(cycle_time / 1000);
+    last_run = micros();
+}
+
+// =============================================================================
+// SETUP
+// =============================================================================
+void setup()
+{
+    // Turn off WiFi radio on ESP32/ESP8266 if not using WiFi
+    #ifndef MBTCP
+        #if defined(BOARD_ESP8266) || defined(BOARD_ESP32)
+            WiFi.mode(WIFI_OFF);
+        #endif
+    #endif
+
+    // Bind located variables to I/O buffer pointers
+    runtime_bind_located_vars();
+
+    // Discover tasks and compute scheduling
+    runtime_discover_tasks();
+
+    // Initialize hardware (HAL -- unchanged)
+    hardwareInit();
+
+    // Establish the run/stop state. Must follow hardwareInit() so the HAL has
+    // already configured its mode-switch pin: a board powered up with the
+    // switch in STOP must never execute a scan. Boards with no mode switch
+    // read RUN and start immediately, as they always have.
+    runtime_init_plc_state();
+
+    // -----------------------------------------------------------------------
+    // License gate. Hand the stored license blob to the license-core so it can
+    // verify it and arm its demo timer.
+    //
+    // With no license-core linked, `license_gate_init()` is the weak default in
+    // license_gate_weak.cpp and this whole block is a harmless no-op: actuation
+    // then stays unconditionally allowed, i.e. a board that never had licensing
+    // behaves exactly as before. `millis()` gives the core the same time base the
+    // runtime uses, with no esp_timer dependency.
+    //
+    // THE HARDWARE ANCHOR IS NOT PASSED IN. An earlier design read `UniqueID`
+    // here and handed the bytes over, which made the board's IDENTITY a claim
+    // made by the OPEN firmware: licensing hardware you do not own cost one edit
+    // to this file, substituting the target's anchor. The license-core reads the
+    // silicon itself, inside the closed artifact, so there is nothing here to
+    // substitute. (FC 0x48 still REPORTS the anchor to the editor, so a purchase
+    // can be bound to this board — reporting an identity and asserting one are
+    // different things.)
+    // -----------------------------------------------------------------------
+    {
+        // Zero-initialised: on a failed read the core is handed length 0, and a
+        // buffer of indeterminate bytes behind a zero length is the kind of detail
+        // that turns into a hard-to-place bug the first time someone reads past it.
+        uint8_t lic_blob[LIC_BLOB_SIZE] = {0};
+        size_t  lic_len = 0;
+        if (license_store_read(lic_blob, sizeof(lic_blob), &lic_len) != LIC_STORE_OK)
+        {
+            // EMPTY / CORRUPT / UNSUPPORTED / any error: nothing usable was read,
+            // so present a zero-length blob. The core's verify rejects it and
+            // starts the demo window; with no core the weak gate ignores the args.
+            lic_len = 0;
+        }
+
+        license_gate_init(lic_blob, lic_len, (uint32_t)millis());
+    }
+
+    #ifdef MODBUS_ENABLED
+        #ifdef MBSERIAL
+            #ifdef MBSERIAL_ON_SECONDARY
+                // Dual-serial: Modbus RTU runs on a secondary UART (below) while
+                // the always-on debugger keeps the default serial — bring it up.
+                DEBUG_IFACE.begin(DEBUG_BAUD);
+            #endif
+            #ifdef MBSERIAL_TXPIN
+                // Disable TX pin from OpenPLC hardware layer
+                for (int i = 0; i < NUM_DISCRETE_INPUT; i++)
+                {
+                    if (pinMask_DIN[i] == MBSERIAL_TXPIN) pinMask_DIN[i] = 255;
+                }
+                for (int i = 0; i < NUM_ANALOG_INPUT; i++)
+                {
+                    if (pinMask_AIN[i] == MBSERIAL_TXPIN) pinMask_AIN[i] = 255;
+                }
+                for (int i = 0; i < NUM_DISCRETE_OUTPUT; i++)
+                {
+                    if (pinMask_DOUT[i] == MBSERIAL_TXPIN) pinMask_DOUT[i] = 255;
+                }
+                for (int i = 0; i < NUM_ANALOG_OUTPUT; i++)
+                {
+                    if (pinMask_AOUT[i] == MBSERIAL_TXPIN) pinMask_AOUT[i] = 255;
+                }
+                MBSERIAL_IFACE.begin(MBSERIAL_BAUD);
+                mbconfig_serial_iface(&MBSERIAL_IFACE, MBSERIAL_BAUD, MBSERIAL_TXPIN);
+            #else
+                MBSERIAL_IFACE.begin(MBSERIAL_BAUD);
+                mbconfig_serial_iface(&MBSERIAL_IFACE, MBSERIAL_BAUD, -1);
+            #endif
+            modbus.slaveid = MBSERIAL_SLAVE;
+            // NOTE (single-serial model): the debugger and Modbus RTU share one
+            // mb_serialport. When MBSERIAL_SHARES_DEBUG_SERIAL is defined the RTU
+            // port IS the debugger's default serial, so this single begin() also
+            // brings up the debugger. Running the debugger on the default USB
+            // serial while RTU uses a *different* UART simultaneously would need
+            // a second serial handler — a documented follow-up.
+        #elif defined(DEBUGGER_ENABLED)
+            // Modbus TCP-only build: no MBSERIAL, but the always-on debugger
+            // still needs the default serial up on mb_serialport to respond.
+            DEBUG_IFACE.begin(DEBUG_BAUD);
+            mbconfig_serial_iface(&DEBUG_IFACE, DEBUG_BAUD, -1);
+            modbus.slaveid = DEBUG_SLAVE;
+        #endif
+
+        #ifdef MBTCP
+            uint8_t mac[] = { MBTCP_MAC };
+            uint8_t ip[] = { MBTCP_IP };
+            uint8_t dns[] = { MBTCP_DNS };
+            uint8_t gateway[] = { MBTCP_GATEWAY };
+            uint8_t subnet[] = { MBTCP_SUBNET };
+
+            if (sizeof(ip)/sizeof(uint8_t) < 4)
+                mbconfig_ethernet_iface(mac, NULL, NULL, NULL, NULL);
+            else if (sizeof(dns)/sizeof(uint8_t) < 4)
+                mbconfig_ethernet_iface(mac, ip, NULL, NULL, NULL);
+            else if (sizeof(gateway)/sizeof(uint8_t) < 4)
+                mbconfig_ethernet_iface(mac, ip, dns, NULL, NULL);
+            else if (sizeof(subnet)/sizeof(uint8_t) < 4)
+                mbconfig_ethernet_iface(mac, ip, dns, gateway, NULL);
+            else
+                mbconfig_ethernet_iface(mac, ip, dns, gateway, subnet);
+        #endif
+
+        init_mbregs(MAX_ANALOG_OUTPUT + MAX_MEMORY_WORD, MAX_MEMORY_DWORD, MAX_MEMORY_LWORD, MAX_DIGITAL_OUTPUT, MAX_ANALOG_INPUT, MAX_DIGITAL_INPUT);
+        mapEmptyBuffers();
+    #elif defined(DEBUGGER_ENABLED)
+        // Always-on debugger without full Modbus: bring up the serial port and
+        // the Modbus RTU framing/slave id ONLY. The debugger reads/writes IEC
+        // variables directly through the strucpp debug table (openplc_debug_*),
+        // so it needs NO operation buffers — init_mbregs()/mapEmptyBuffers() are
+        // deliberately not called here, saving SRAM on small boards.
+        DEBUG_IFACE.begin(DEBUG_BAUD);
+        mbconfig_serial_iface(&DEBUG_IFACE, DEBUG_BAUD, -1);
+        modbus.slaveid = DEBUG_SLAVE;
+    #endif
+
+    setupCycleDelay(base_tick_ns);
+
+    #ifdef USE_ARDUINO_SKETCH
+        sketch_setup();
+    #endif
+}
+
+// =============================================================================
+// MAP EMPTY BUFFERS (for Modbus)
+// =============================================================================
+#ifdef MODBUS_ENABLED
+void mapEmptyBuffers()
+{
+    for (int i = 0; i < MAX_DIGITAL_OUTPUT; i++)
+    {
+        if (bool_output[i/8][i%8] == NULL)
+        {
+            bool_output[i/8][i%8] = (IEC_BOOL *)malloc(sizeof(IEC_BOOL));
+            *bool_output[i/8][i%8] = 0;
+        }
+    }
+    for (int i = 0; i < MAX_ANALOG_OUTPUT; i++)
+    {
+        if (int_output[i] == NULL)
+        {
+            int_output[i] = (IEC_UINT *)(modbus.holding + i);
+        }
+    }
+    for (int i = 0; i < MAX_DIGITAL_INPUT; i++)
+    {
+        if (bool_input[i/8][i%8] == NULL)
+        {
+            bool_input[i/8][i%8] = (IEC_BOOL *)malloc(sizeof(IEC_BOOL));
+            *bool_input[i/8][i%8] = 0;
+        }
+    }
+    for (int i = 0; i < MAX_ANALOG_INPUT; i++)
+    {
+        if (int_input[i] == NULL)
+        {
+            int_input[i] = (IEC_UINT *)(modbus.input_regs + i);
+        }
+    }
+    #if !defined(__AVR_ATmega328P__) && !defined(__AVR_ATmega168__) && !defined(__AVR_ATmega32U4__) && !defined(__AVR_ATmega16U4__)
+        for (int i = 0; i < MAX_MEMORY_WORD; i++)
+        {
+            if (int_memory[i] == NULL)
+            {
+                int_memory[i] = (IEC_UINT *)(modbus.holding + MAX_ANALOG_OUTPUT + i);
+            }
+        }
+        for (int i = 0; i < MAX_MEMORY_DWORD; i++)
+        {
+            if (dint_memory[i] == NULL)
+            {
+                dint_memory[i] = (IEC_UDINT *)(modbus.dint_memory + i);
+            }
+        }
+        for (int i = 0; i < MAX_MEMORY_LWORD; i++)
+        {
+            if (lint_memory[i] == NULL)
+            {
+                lint_memory[i] = (IEC_ULINT *)(modbus.lint_memory + i);
+            }
+        }
+    #endif
+}
+
+// =============================================================================
+// MODBUS TASK
+// =============================================================================
+void modbusTask()
+{
+    // Sync OpenPLC Buffers with Modbus Buffers
+    for (int i = 0; i < MAX_DIGITAL_OUTPUT; i++)
+    {
+        if (bool_output[i/8][i%8] != NULL)
+        {
+            write_discrete(i, COILS, (bool)*bool_output[i/8][i%8]);
+        }
+    }
+    for (int i = 0; i < MAX_ANALOG_OUTPUT; i++)
+    {
+        if (int_output[i] != NULL)
+        {
+            modbus.holding[i] = *int_output[i];
+        }
+    }
+    for (int i = 0; i < MAX_DIGITAL_INPUT; i++)
+    {
+        if (bool_input[i/8][i%8] != NULL)
+        {
+            write_discrete(i, INPUTSTATUS, (bool)*bool_input[i/8][i%8]);
+        }
+    }
+    for (int i = 0; i < MAX_ANALOG_INPUT; i++)
+    {
+        if (int_input[i] != NULL)
+        {
+            modbus.input_regs[i] = *int_input[i];
+        }
+    }
+    #if !defined(__AVR_ATmega328P__) && !defined(__AVR_ATmega168__) && !defined(__AVR_ATmega32U4__) && !defined(__AVR_ATmega16U4__)
+        for (int i = 0; i < MAX_MEMORY_WORD; i++)
+        {
+            if (int_memory[i] != NULL)
+            {
+                modbus.holding[i + MAX_ANALOG_OUTPUT] = *int_memory[i];
+            }
+        }
+        for (int i = 0; i < MAX_MEMORY_DWORD; i++)
+        {
+            if (dint_memory[i] != NULL)
+            {
+                modbus.dint_memory[i] = *dint_memory[i];
+            }
+        }
+        for (int i = 0; i < MAX_MEMORY_LWORD; i++)
+        {
+            if (lint_memory[i] != NULL)
+            {
+                modbus.lint_memory[i] = *lint_memory[i];
+            }
+        }
+    #endif
+
+    // Read changes from clients
+    mbtask();
+
+    // Write changes back to OpenPLC Buffers
+    for (int i = 0; i < MAX_DIGITAL_OUTPUT; i++)
+    {
+        if (bool_output[i/8][i%8] != NULL)
+        {
+            *bool_output[i/8][i%8] = get_discrete(i, COILS);
+        }
+    }
+    for (int i = 0; i < MAX_ANALOG_OUTPUT; i++)
+    {
+        if (int_output[i] != NULL)
+        {
+            *int_output[i] = modbus.holding[i];
+        }
+    }
+    #if !defined(__AVR_ATmega328P__) && !defined(__AVR_ATmega168__) && !defined(__AVR_ATmega32U4__) && !defined(__AVR_ATmega16U4__)
+        for (int i = 0; i < MAX_MEMORY_WORD; i++)
+        {
+            if (int_memory[i] != NULL)
+            {
+                *int_memory[i] = modbus.holding[i + MAX_ANALOG_OUTPUT];
+            }
+        }
+        for (int i = 0; i < MAX_MEMORY_DWORD; i++)
+        {
+            if (dint_memory[i] != NULL)
+            {
+                *dint_memory[i] = modbus.dint_memory[i];
+            }
+        }
+        for (int i = 0; i < MAX_MEMORY_LWORD; i++)
+        {
+            if (lint_memory[i] != NULL)
+            {
+                *lint_memory[i] = modbus.lint_memory[i];
+            }
+        }
+    #endif
+
+    // The reverse-copies above (COILS → bool_output, holding → int_output,
+    // memory) write located variables' raw storage directly, clobbering any
+    // debugger force. Re-impose forces here so forcing works while STILL
+    // mirroring Modbus client writes into mapped outputs. (Supersedes the open
+    // PR #719, which made forcing work by deleting the digital reverse-copy —
+    // at the cost of Modbus coil mirroring.)
+    runtime_apply_located_forces();
+}
+#endif
+
+// =============================================================================
+// SCHEDULER
+// =============================================================================
+void scheduler()
+{
+    runtime_plc_cycle();
+
+    #ifdef USE_ARDUINO_SKETCH
+        sketch_loop();
+    #endif
+
+    #if defined(MODBUS_ENABLED)
+        modbusTask();
+    #elif defined(DEBUGGER_ENABLED)
+        // Debug-only: poll the serial transport for debugger requests. No buffer
+        // sync (modbusTask's mirror loops) because there are no operation buffers.
+        mbtask();
+    #endif
+
+    if (!first_cycle)
+    {
+        first_cycle = true;
+        // Recalculate last_run to avoid time drift on the first cycle
+        last_run = micros() - scan_cycle;
+    }
+}
+
+// =============================================================================
+// MAIN LOOP
+// =============================================================================
+void loop()
+{
+    if ((micros() - last_run) >= scan_cycle)
+    {
+        scheduler();
+        last_run += scan_cycle;
+    }
+
+    #if defined(MODBUS_ENABLED)
+    // Only run Modbus task again if we have at least 10ms gap until the next cycle
+    if ((micros() - last_run) >= 10000)
+    {
+        modbusTask();
+    }
+    #elif defined(DEBUGGER_ENABLED)
+    // Debug-only: give the debugger extra serial-poll time between cycles too.
+    if ((micros() - last_run) >= 10000)
+    {
+        mbtask();
+    }
+    #endif
+
+    #ifdef SIMULATOR_MODE
+    __asm volatile("sleep");
+    #endif
+}

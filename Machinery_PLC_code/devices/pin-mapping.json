@@ -1,0 +1,82 @@
+{
+  "ESP32-DOIT DEVKIT V1": [
+    {
+      "pin": "13",
+      "pinType": "digitalInput",
+      "address": "%IX0.0",
+      "alias": ""
+    },
+    {
+      "pin": "12",
+      "pinType": "digitalInput",
+      "address": "%IX0.1",
+      "alias": ""
+    },
+    {
+      "pin": "14",
+      "pinType": "digitalInput",
+      "address": "%IX0.2",
+      "alias": ""
+    },
+    {
+      "pin": "27",
+      "pinType": "digitalInput",
+      "address": "%IX0.3",
+      "alias": ""
+    },
+    {
+      "pin": "26",
+      "pinType": "digitalInput",
+      "address": "%IX0.4",
+      "alias": ""
+    },
+    {
+      "pin": "25",
+      "pinType": "digitalInput",
+      "address": "%IX0.5",
+      "alias": ""
+    },
+    {
+      "pin": "33",
+      "pinType": "digitalInput",
+      "address": "%IX0.6",
+      "alias": ""
+    },
+    {
+      "pin": "32",
+      "pinType": "digitalInput",
+      "address": "%IX0.7",
+      "alias": ""
+    },
+    {
+      "pin": "21",
+      "pinType": "digitalOutput",
+      "address": "%QX0.0",
+      "alias": ""
+    },
+    {
+      "pin": "05",
+      "pinType": "digitalOutput",
+      "address": "%QX0.1",
+      "alias": ""
+    },
+    {
+      "pin": "04",
+      "pinType": "digitalOutput",
+      "address": "%QX0.2",
+      "alias": ""
+    },
+    {
+      "pin": "19",
+      "pinType": "digitalOutput",
+      "address": "%QX0.3",
+      "alias": ""
+    },
+    {
+      "pin": "18",
+      "pinType": "digitalOutput",
+      "address": "%QX0.4",
+      "alias": "Fa"
+    }
+  ]
+}

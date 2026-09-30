@@ -1,7 +1,10 @@
 # Automation Process 
 
 ## Dashboard 
+<img src="https://github.com/jonss0777/Slitting-Machine-Automation-Edge-Controller/blob/65b8467494b5c0e359c7f91d4499d1fee6c127e6/diagrams/Grafana_Dashboard.png" alt="Grafana Dashboard" with=
+"500" heigt="500">
 [Link](https://dariosystems.space/login)
+
 
 ## System States 
 

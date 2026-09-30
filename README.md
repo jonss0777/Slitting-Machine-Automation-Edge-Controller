@@ -18,13 +18,13 @@ State machine of the different states the system could enter while running.
 
 ## System Arquitechture 
 
-The components that emcompass the system and their connection protocols.
+The components that encompass the system and their connection protocols.
 
 <img src="https://github.com/jonss0777/Slitting-Machine-Automation-Edge-Controller/blob/97e48c64b4adb0d1e04cad088cc4fc40a8b98ece/diagrams/Software_Process.png" alt="System Diagram" width="500" height="500">
 
 ## Physical Prototype 
 
-A handcrafted prototype using a ESP32 and OpenPLC to simulate a robot arm, coveyor, pneumatic roller and the slitting machine.
+A handcrafted prototype using a ESP32 to run a OpenPLC program to simulate a robot arm, coveyor, pneumatic roller and the slitting machine.
 
 <img src="https://github.com/jonss0777/Slitting-Machine-Automation-Edge-Controller/blob/97e48c64b4adb0d1e04cad088cc4fc40a8b98ece/diagrams/Circuit.jpeg" alt="Physical Circuit" width="600" height="750">
 

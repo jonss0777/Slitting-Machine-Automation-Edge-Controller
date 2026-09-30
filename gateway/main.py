@@ -102,8 +102,8 @@ class OpenPLCPoller:
                        
                         #registers = holding_res.registers
                         record = PLCState(
-                            state=rr_counters.registers[0],
-                            auto_step=rr_counters.registers[2],
+                            state=rr_base.registers[0],
+                            auto_step=rr_base.registers[1],
                             successful_runs=client.convert_from_registers( 
                             success_regs, data_type=client.DATATYPE.INT32, word_order=WORD_ORDER
                             ),
